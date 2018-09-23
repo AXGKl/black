@@ -164,6 +164,23 @@ def read_pyproject_toml(
     return value
 
 
+GRAMMARS: List[Tuple[str, Any]] = [
+    ("py3", pygram.python_grammar_no_print_statement_no_exec_statement),
+    ("py2", pygram.python_grammar_no_print_statement),
+    ("py2_print_stmt", pygram.python_grammar),
+]
+grammar_choices: List[str] = ["all"]  # the default: we try any, in the order given
+grammar_choices.extend([g[0] for g in GRAMMARS])  # click option
+grammar_chosen: List[str] = []
+
+
+class Quotes:
+    single_bad = "'"
+    single_good = '"'
+    tripple_bad = "'''"
+    tripple_good = '"""'
+
+
 @click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option(
     "-l",
@@ -172,6 +189,23 @@ def read_pyproject_toml(
     default=DEFAULT_LINE_LENGTH,
     help="How many characters per line to allow.",
     show_default=True,
+)
+@click.option(
+    "-g",
+    "--grammar",
+    type=click.Choice(grammar_choices),
+    default="all",
+    help=(
+        "Restrict Black to using only *one* grammar when parsing source code."
+        "By default Black tries to apply various valid Python grammars "
+        "(currently: %s) and "
+        "will reformat code based on the first one not producing syntax errors. "
+        "Downside: Black might return error messages "
+        "not fitting your intended grammar when *any* of these detect errors. "
+        "Using the switch you can bind Black to using only one grammar. "
+        "Note: This switch must be passed via the command line."
+        % ", ".join([g[0] for g in GRAMMARS])
+    ),
 )
 @click.option(
     "--py36",
@@ -190,6 +224,7 @@ def read_pyproject_toml(
         "(useful when piping source on standard input)."
     ),
 )
+@click.option("-A", "--prefer-single-quotes", is_flag=True, help="Prefer single quotes")
 @click.option(
     "-S",
     "--skip-string-normalization",
@@ -280,12 +315,14 @@ def read_pyproject_toml(
 def main(
     ctx: click.Context,
     line_length: int,
+    grammar: str,
     check: bool,
     diff: bool,
     fast: bool,
     pyi: bool,
     py36: bool,
     skip_string_normalization: bool,
+    prefer_single_quotes: bool,
     quiet: bool,
     verbose: bool,
     include: str,
@@ -313,6 +350,11 @@ def main(
     report = Report(check=check, quiet=quiet, verbose=verbose)
     root = find_project_root(src)
     sources: Set[Path] = set()
+    if grammar != "all":
+        grammar_chosen.append(grammar)
+    if prefer_single_quotes:
+        Quotes.single_bad, Quotes.single_good = '"', "'"
+        Quotes.tripple_bad, Quotes.tripple_good = '"""', "'''"
     for s in src:
         p = Path(s)
         if p.is_dir():
@@ -651,19 +693,13 @@ def decode_bytes(src: bytes) -> Tuple[FileContent, Encoding, NewLine]:
         return tiow.read(), encoding, newline
 
 
-GRAMMARS = [
-    pygram.python_grammar_no_print_statement_no_exec_statement,
-    pygram.python_grammar_no_print_statement,
-    pygram.python_grammar,
-]
-
-
 def lib2to3_parse(src_txt: str) -> Node:
     """Given a string with source, return the lib2to3 Node."""
-    grammar = pygram.python_grammar_no_print_statement
     if src_txt[-1:] != "\n":
         src_txt += "\n"
-    for grammar in GRAMMARS:
+    for name, grammar in GRAMMARS:
+        if grammar_chosen and grammar_chosen[0] != name:
+            continue
         drv = driver.Driver(grammar, pytree.convert)
         try:
             result = drv.parse_string(src_txt, True)
@@ -2476,19 +2512,21 @@ def normalize_string_quotes(leaf: Leaf) -> None:
 
     Note: Mutates its argument.
     """
+    q = Quotes
+    sb, sg, tb, tg = q.single_bad, q.single_good, q.tripple_bad, q.tripple_good
     value = leaf.value.lstrip("furbFURB")
-    if value[:3] == '"""':
+    if value[:3] == tg:
         return
 
-    elif value[:3] == "'''":
-        orig_quote = "'''"
-        new_quote = '"""'
-    elif value[0] == '"':
-        orig_quote = '"'
-        new_quote = "'"
+    elif value[:3] == tb:
+        orig_quote = tb
+        new_quote = tg
+    elif value[0] == sg:
+        orig_quote = sg
+        new_quote = sb
     else:
-        orig_quote = "'"
-        new_quote = '"'
+        orig_quote = sb
+        new_quote = sg
     first_quote_pos = leaf.value.find(orig_quote)
     if first_quote_pos == -1:
         return  # There's an internal error
@@ -2521,16 +2559,16 @@ def normalize_string_quotes(leaf: Leaf) -> None:
             if "\\" in str(m):
                 # Do not introduce backslashes in interpolated expressions
                 return
-    if new_quote == '"""' and new_body[-1:] == '"':
+    if new_quote == tg and new_body[-1:] == sg:
         # edge case:
-        new_body = new_body[:-1] + '\\"'
+        new_body = new_body[:-1] + "\\" + sg
     orig_escape_count = body.count("\\")
     new_escape_count = new_body.count("\\")
     if new_escape_count > orig_escape_count:
         return  # Do not introduce more escaping
 
-    if new_escape_count == orig_escape_count and orig_quote == '"':
-        return  # Prefer double quotes
+    if new_escape_count == orig_escape_count and orig_quote == sg:
+        return
 
     leaf.value = f"{prefix}{new_quote}{new_body}{new_quote}"
 
